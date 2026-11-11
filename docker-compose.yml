@@ -1,0 +1,108 @@
+# =============================================================================
+#  ICS Digital Forensics Lab - water tank process
+#  Isolated bridge network ics_net (172.28.0.0/24), all containers on UTC.
+#  Services: plc (OpenPLC v3), hmi (historian), attacker (idle), sniffer (tcpdump)
+# =============================================================================
+
+networks:
+  ics_net:
+    name: ics_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
+
+services:
+
+  # --- PLC: OpenPLC Runtime v3, built from the official GitHub repo ----------
+  plc:
+    build:
+      context: ./plc                 # clones OpenPLC_v3 inside the image (pinned)
+      dockerfile: Dockerfile
+    image: ics-openplc:v3
+    container_name: ics-plc
+    hostname: plc
+    environment:
+      - TZ=UTC
+    networks:
+      ics_net:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "8080:8080"                  # web UI exposed to the Windows host
+    # Modbus/TCP 502 stays internal to ics_net (captured by the sniffer).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 25s
+    restart: "no"
+
+  # --- HMI + historian: polls the PLC every second, logs to CSV (UTC ISO8601)-
+  hmi:
+    build:
+      context: ./hmi
+    image: ics-hmi:latest
+    container_name: ics-hmi
+    hostname: hmi
+    environment:
+      - TZ=UTC
+      - PLC_HOST=172.28.0.10
+      - PLC_PORT=502
+      - POLL_INTERVAL=1
+      - HISTORIAN_CSV=/app/historian.csv
+    networks:
+      ics_net:
+        ipv4_address: 172.28.0.20
+    volumes:
+      - ./hmi:/app                   # live code + historian.csv visible on host
+    depends_on:
+      plc:
+        condition: service_healthy
+    restart: "no"
+
+  # --- Attacker workstation: idle, driven with `docker exec` ------------------
+  attacker:
+    build:
+      context: ./attacker
+    image: ics-attacker:latest
+    container_name: ics-attacker
+    hostname: attacker
+    environment:
+      - TZ=UTC
+      - PLC_HOST=172.28.0.10
+      - PLC_PORT=502
+      - PLC_WEB=http://172.28.0.10:8080
+      - HMI_HOST=172.28.0.20
+      - SUBNET=172.28.0.0/24
+    networks:
+      ics_net:
+        ipv4_address: 172.28.0.66
+    volumes:
+      - ./attacker:/app              # attack scripts
+      - ./plc/programs:/app/programs:ro   # malicious .st the attacker uploads
+      - ./evidence:/evidence         # recon output can be saved alongside evidence
+    command: ["sleep", "infinity"]   # idle by default
+    restart: "no"
+
+  # --- Sniffer: shares the PLC network namespace, tcpdump -> ./evidence/pcap --
+  sniffer:
+    image: nicolaka/netshoot:latest
+    container_name: ics-sniffer
+    network_mode: "service:plc"      # see exactly what reaches/leaves the PLC
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./evidence:/evidence
+    # -i any: capture on every interface in the PLC netns; -U: flush each packet
+    # so the pcap is complete even if the container is killed to finalize it.
+    command: >
+      tcpdump -i any -U -s 0 -w /evidence/pcap/ics_capture.pcap
+    depends_on:
+      plc:
+        condition: service_started
+    restart: "no"
